@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import csv
 import argparse
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Optional
 from sys import stderr
 import re
@@ -15,7 +15,7 @@ PHOTOS_DURING_RDA = 8
 BITS_PER_PIXEL = 10
 IMAGE_SIZE = 2048 * 2048
 RDA_ACQUIRED_DATA = PHOTOS_DURING_RDA * BITS_PER_PIXEL * IMAGE_SIZE
-LOSSY_COMPRESSION_RATE = 9
+LOSSY_COMPRESSION_RATE = 8
 LOSSLESS_COMPRESSION_RATE = 1.7
 
 # TELEMETRY CONSTANTS
@@ -25,12 +25,12 @@ DETAILED_FRAME_SIZE = 1400
 DETAILED_COLLECTION_PERIOD_S = 10
 
 # TRANSMISSIONS CONSTANTS
-ENDURO_PROT_OVERHEAD = 1.7
+ENDURO_PROT_OVERHEAD = 1.3 * 1.2  # 1.7
 FEC_RATE = 7 / 8
 COMM_OVERHEAD = ENDURO_PROT_OVERHEAD * (1 / FEC_RATE)
 SBAND_BPS_BASE = 100 * 10**3
-UHF_BPS_BASE = 9600
 SBAND_BPS = SBAND_BPS_BASE / COMM_OVERHEAD
+UHF_BPS_BASE = 9600
 UHF_BPS = UHF_BPS_BASE / COMM_OVERHEAD
 
 
@@ -62,19 +62,20 @@ ROW_IDX = 1
 
 @dataclass
 class MissionState:
-    stored_telemetry: float = 0
-    sent_telemetry: float = 0
-
     s_band_start: Optional[datetime] = None
     uhf_band_start: Optional[datetime] = None
     rda_start: Optional[datetime] = None
 
-    stored_summaries: float = 0
-    sent_summaries: float = 0
+    stored_telemetry: float = 0.0
+    sent_telemetry: float = 0.0
+    stored_summaries: float = 0.0
+    sent_summaries: float = 0.0
+    wasted_uhf_band: float = 0.0
 
-    total_images: float = 0
-    stored_image_data: float = 0
-    sent_image_data: float = 0
+    total_images: float = 0.0
+    stored_image_data: float = 0.0
+    sent_image_data: float = 0.0
+    wasted_s_band: float = 0.0
 
 
 def mb(size):
@@ -148,21 +149,55 @@ def check_header(col, expected):
         )
 
 
-def check_open_close(value, event):
+def check_is_opened(value, event):
     global ROW_IDX
 
-    if "start" in event:
-        if value is not None:
-            raise ValueError(
-                f"Unexpected event, encountered '{event}' twice, without a corresponding end, at row {ROW_IDX}"
-            )
-    elif "end" in event:
-        if value is None:
-            raise ValueError(
-                f"Unexpected event, encountered '{event}' twice, without a corresponding start, at row {ROW_IDX}"
-            )
+    if value is None:
+        raise ValueError(
+            f"Unexpected event, encountered '{event}' twice, without a corresponding start, at row {ROW_IDX}"
+        )
+
+
+def check_is_closed(value, event):
+    global ROW_IDX
+
+    if value is not None:
+        raise ValueError(
+            f"Unexpected event, encountered '{event}' twice, without a corresponding end, at row {ROW_IDX}"
+        )
+
+
+def normalize_time(time: str):
+    global ROW_IDX
+
+    if "/" in time:
+        return datetime.strptime(time, "%d/%m/%Y %H:%M")
     else:
-        raise ValueError(f"Unexpected event, encountered '{event}', at row {ROW_IDX}")
+        try:
+            return datetime.strptime(time, "%d-%b-%Y %H:%M:%S")
+        except:
+            pass
+
+        try:
+            return datetime.strptime(time, "%d-%B-%Y %H:%M:%S")
+        except:
+            raise ValueError(f"Unrecognized time '{time}', at row {ROW_IDX}")
+
+
+def normalize_event(event: str):
+    event = normalize(event)
+    if event == E_START_SIMULATION:
+        return event
+
+    # get rid of "orbit x" or "  - x" suffixes
+    return "_".join(event.split("_")[:-2]).replace("-", "_")
+
+
+def normalize_duration(duration: str):
+    split_duration = [int(x) for x in duration.split(":")]
+    return timedelta(
+        hours=split_duration[0], minutes=split_duration[1], seconds=split_duration[2]
+    )
 
 
 def process_row(state: MissionState, row):
@@ -180,24 +215,17 @@ def process_row(state: MissionState, row):
         _,
     ) = row
 
-    # normalize some of the columns
-    if "/" in time:
-        time = datetime.strptime(time, "%d/%m/%Y %H:%M")
-    else:
-        try:
-            time = datetime.strptime(time, "%d-%b-%Y %H:%M:%S")
-        except:
-            time = datetime.strptime(time, "%d-%B-%Y %H:%M:%S")
+    time = normalize_time(time)
+    duration = normalize_duration(duration)
+    event = normalize_event(event)
 
-    duration = [int(x) for x in duration.split(":")]
-    duration = timedelta(hours=duration[0], minutes=duration[1], seconds=duration[2])
+    # TODO: fix this, this would assume that we are sending full frames, ebcause the constants are not updated
+    state.stored_summaries += SUMMARY_FRAME_SIZE * (
+        duration.total_seconds() / SUMMARY_COLLECTION_PERIOD_S
+    )
 
-    event = normalize(event)
     if event == E_START_SIMULATION:
         return
-
-    # get rid of "orbit x" or "  - x" suffixes
-    event = "_".join(event.split("_")[:-2]).replace("-", "_")
 
     # actually process the event
     if (
@@ -213,31 +241,108 @@ def process_row(state: MissionState, row):
         # simulate that at the moment, so ignore it as well
         pass
     elif event == E_RDA_START:
-        check_open_close(state.rda_start, event)
+        check_is_closed(state.rda_start, event)
         state.rda_start = time
+
     elif event == E_RDA_END:
-        check_open_close(state.rda_start, event)
+        check_is_opened(state.rda_start, event)
         state.rda_start = None
+
+        state.total_images += PHOTOS_DURING_RDA
+        state.stored_image_data += RDA_ACQUIRED_DATA / LOSSY_COMPRESSION_RATE
+
     elif event == E_S_BAND_COM_START:
-        check_open_close(state.s_band_start, event)
+        check_is_closed(state.s_band_start, event)
         state.s_band_start = time
+
     elif event == E_S_BAND_COM_END:
-        check_open_close(state.s_band_start, event)
-        print("S-band", time - state.s_band_start)
+        check_is_opened(state.s_band_start, event)
+        delta: timedelta = time - state.s_band_start
         state.s_band_start = None
+
+        potential_transfer = SBAND_BPS * delta.total_seconds()
+        print(SBAND_BPS)
+        print(delta.total_seconds())
+        print(potential_transfer)
+        needed = state.stored_image_data - state.sent_image_data
+
+        state.wasted_s_band += max(potential_transfer - needed, 0)
+        state.sent_image_data += min(needed, potential_transfer)
+
     elif event == E_UHF_COM_START:
-        check_open_close(state.uhf_band_start, event)
+        check_is_closed(state.uhf_band_start, event)
         state.uhf_band_start = time
+
     elif event == E_UHF_COM_END:
-        check_open_close(state.uhf_band_start, event)
-        print("UHF", time - state.uhf_band_start)
+        check_is_opened(state.uhf_band_start, event)
+        delta: timedelta = time - state.uhf_band_start
         state.uhf_band_start = None
+
+        # TODO: telecommands + actual frame data
+        potential_transfer = UHF_BPS * delta.total_seconds()
+        needed = state.stored_summaries - state.sent_summaries
+
+        state.wasted_uhf_band += max(potential_transfer - needed, 0)
+        state.sent_summaries += min(needed, potential_transfer)
+
     else:
         raise ValueError(f"Unrecognized event: '{event}'")
 
     # Telemetry is always processed so, add it at the end of the processing
     global ROW_IDX
     ROW_IDX += 1
+
+
+def print_state(state: MissionState):
+    global ROW_IDX
+
+    (
+        time,
+        orbit,
+        duration,
+        shadow,
+        event,
+        op_mode,
+        op_desc,
+        adcs_mode,
+        comments,
+        useful_ino,
+        _,
+    ) = row
+
+    time = normalize_time(time)
+    duration = normalize_duration(duration)
+    event = normalize_event(event)
+
+    def process_number_to_MiB(num: float):
+        return num / 8 / 10**6
+
+    # This looks like shit
+    print(f"============== {time} : {event:20} =================")
+    print(
+        f"Stored summaries : {process_number_to_MiB(state.stored_summaries):20.6f} MiB"
+    )
+    print(f"Sent   summaries : {process_number_to_MiB(state.sent_summaries):20.6f} MiB")
+    print(
+        f"To be transfered : {process_number_to_MiB(state.stored_summaries - state.sent_summaries):20.1f} MiB"
+    )
+    print(
+        f"Wasted UHF       : {process_number_to_MiB(state.wasted_uhf_band):20.6f} MiB"
+    )
+    print()
+    print(
+        f"Stored image data: {process_number_to_MiB(state.stored_image_data):20.6f} MiB"
+    )
+    print(
+        f"Sent   image data: {process_number_to_MiB(state.sent_image_data):20.6f} MiB"
+    )
+    print(
+        f"To be transfered : {process_number_to_MiB(state.stored_image_data - state.sent_image_data):20.6f} MiB"
+    )
+    print(f"Wasted S-Band    : {process_number_to_MiB(state.wasted_s_band):20.6f} MiB")
+    print()
+    # print(state.sent_summaries)
+    # print(state.wasted_uhf_band)
 
 
 if __name__ == "__main__":
@@ -286,3 +391,4 @@ if __name__ == "__main__":
         state = MissionState()
         for row in reader:
             process_row(state, row)
+            print_state(state)
